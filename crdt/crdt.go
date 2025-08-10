@@ -1,18 +1,52 @@
 // ------------------------------------------------------------
 // simple-go-text-crdt (RGA) — literate, optimized-but-still-simple edition
 // ------------------------------------------------------------
-// This file implements a tiny, readable sequence CRDT for plain text using a
-// simplified RGA (Replicated Growable Array). We now add a few **gentle**
-// optimizations that preserve clarity:
+// This is a tiny, educational CRDT for plain text built on the
+// Replicated Growable Array (RGA) model. The goal is clarity first,
+// with some small optimizations for responsiveness.
 //
-// NEW IN THIS EDITION (compared to the first literate version)
-// -----------------------------------------------------------
-// A) Binary insertion for siblings (avoid re-sorting entire slice each time).
-// B) Cached rendered text with a dirty flag (avoid rebuilding on every Text()).
-// C) Visible length counter + cached last-visible ID (fast appends and checks).
-// D) Buffer deletes whose target hasn't arrived yet (robust out-of-order).
+// MODEL OVERVIEW
+// --------------
+// The document is a tree (actually a forest) of character elements:
+// - Each element has a unique ID (Replica, Counter) minted by the
+//   replica that created it.
+// - Inserts are addressed by *parent ID*: “insert X after P”, not
+//   “insert at index 17”. This makes replay and out-of-order delivery
+//   robust.
+// - Concurrent inserts after the same parent are sorted deterministically
+//   by (Counter, Replica) to ensure all replicas see the same order.
+// - Deletes are tombstones: we never remove elements, only mark them
+//   invisible. This ensures convergence regardless of operation order.
+// - If an insert arrives before its parent, it is buffered in `waiting`
+//   until the parent arrives. Deletes for unknown targets are buffered in
+//   `waitingDel` until the target is inserted.
 //
-// We still favor understandability over raw speed: no ropes, no complex indexes.
+// OPTIMIZATIONS (still simple)
+// ----------------------------
+// - **Binary insertion** into each parent's children slice instead of
+//   re-sorting on every insert.
+// - **Cached text** with a dirty flag so we only rebuild `Text()` when
+//   something changes.
+// - **Visible count** and **last-visible ID** caches for fast appends
+//   without a full traversal.
+// - **Buffered deletes** for robust out-of-order application.
+//
+// COMPLEXITY
+// ----------
+// - Insertion: O(k) for k siblings after same parent (due to slice insert)
+// - Deletion: O(1) when target known, O(1) to buffer when unknown
+// - Rendering: O(n) only when dirty
+// - Index lookup: O(n) (DFS) — acceptable for learning/demo purposes
+//
+// LIMITATIONS
+// -----------
+// - No tombstone compaction
+// - Per-rune granularity (one element per rune)
+// - Index-based API is naive; no piece tables or ropes for large-scale perf
+//
+// This code is intended for learning CRDT fundamentals, not production.
+// See crdt_test.go for examples covering sequential edits, concurrent
+// edits, idempotency, out-of-order deletes, and fast-path appends.
 // ------------------------------------------------------------
 
 package crdt
@@ -88,13 +122,13 @@ type Doc struct {
 
 	// core storage
 	elems      map[ID]*Element
-	children  map[ID][]ID
-	waiting   map[ID][]InsertOp
+	children   map[ID][]ID
+	waiting    map[ID][]InsertOp
 	waitingDel map[ID][]DeleteOp
-	head ID
+	head       ID
 
 	// lightweight caches
-	visibleCount int
+	visibleCount  int
 	lastVisibleID ID
 	hasLast       bool
 
@@ -107,7 +141,7 @@ func New(replica string) *Doc {
 	d := &Doc{
 		replica:    replica,
 		clock:      0,
-		elems:       make(map[ID]*Element),
+		elems:      make(map[ID]*Element),
 		children:   make(map[ID][]ID),
 		waiting:    make(map[ID][]InsertOp),
 		waitingDel: make(map[ID][]DeleteOp),
@@ -233,7 +267,9 @@ func (d *Doc) ApplyInsert(op InsertOp) {
 
 func (d *Doc) flushWaiting(parent ID) {
 	queue := d.waiting[parent]
-	if len(queue) == 0 { return }
+	if len(queue) == 0 {
+		return
+	}
 	delete(d.waiting, parent)
 	for _, child := range queue {
 		d.ApplyInsert(child)
@@ -268,11 +304,13 @@ func (d *Doc) ApplyDelete(op DeleteOp) {
 func insertSorted(ids []ID, x ID) []ID {
 	pos := sort.Search(len(ids), func(i int) bool {
 		ai := ids[i]
-		if ai.Counter != x.Counter { return ai.Counter >= x.Counter }
+		if ai.Counter != x.Counter {
+			return ai.Counter >= x.Counter
+		}
 		return ai.Replica >= x.Replica
 	})
-	ids = append(ids, ID{})        // grow by one
-	copy(ids[pos+1:], ids[pos:])   // shift tail right
+	ids = append(ids, ID{})      // grow by one
+	copy(ids[pos+1:], ids[pos:]) // shift tail right
 	ids[pos] = x
 	return ids
 }
@@ -280,11 +318,15 @@ func insertSorted(ids []ID, x ID) []ID {
 // predecessorByIndex maps a visible index to the ID to insert after.
 // index==0 -> HEAD; otherwise predecessor is the element at index-1.
 func (d *Doc) predecessorByIndex(index int) ID {
-	if index <= 0 { return d.head }
+	if index <= 0 {
+		return d.head
+	}
 	id, ok := d.idByIndex(index - 1)
 	if !ok {
 		// beyond end: append after last visible (or HEAD if empty)
-		if d.hasLast { return d.lastVisibleID }
+		if d.hasLast {
+			return d.lastVisibleID
+		}
 		return d.head
 	}
 	return id
@@ -301,14 +343,21 @@ func (d *Doc) idByIndex(index int) (ID, bool) {
 			e := d.elems[id]
 			if e.Visible {
 				count++
-				if count == index { found = id; return true }
+				if count == index {
+					found = id
+					return true
+				}
 			}
-			if dfs(id) { return true }
+			if dfs(id) {
+				return true
+			}
 		}
 		return false
 	}
 	_ = dfs(d.head)
-	if count >= index && count >= 0 { return found, true }
+	if count >= index && count >= 0 {
+		return found, true
+	}
 	return ID{}, false
 }
 
@@ -321,7 +370,10 @@ func (d *Doc) lastVisible() (ID, bool) {
 	dfs = func(parent ID) {
 		for _, id := range d.children[parent] {
 			e := d.elems[id]
-			if e.Visible { last = id; seen = true }
+			if e.Visible {
+				last = id
+				seen = true
+			}
 			dfs(id)
 		}
 	}
@@ -334,4 +386,3 @@ func (d *Doc) nextID() ID {
 	d.clock++
 	return ID{Replica: d.replica, Counter: d.clock}
 }
-
