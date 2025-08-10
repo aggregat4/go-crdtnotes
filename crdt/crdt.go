@@ -1,49 +1,41 @@
 // ------------------------------------------------------------
-// simple-go-text-crdt (RGA) — literate, order-cached edition
+// simple-go-text-crdt (RGA) — literate, CHUNKED-ORDER edition
 // ------------------------------------------------------------
-// This is a tiny, educational CRDT for plain text based on the
-// Replicated Growable Array (RGA) model. It is written for clarity
-// first, with a handful of optimizations that keep it responsive.
+// This is a tiny, educational CRDT for plain text using the
+// Replicated Growable Array (RGA) model. It is written for clarity,
+// with a few carefully chosen optimizations so it *feels* snappy.
 //
 // MODEL OVERVIEW
 // --------------
 // • Elements: one per rune, each with a unique ID (Replica, Counter).
-// • Inserts: addressed by *parent ID*: “insert X after P”.
+// • Inserts: addressed by *parent ID* — “insert X after P”.
 // • Ordering: siblings (concurrent inserts after same parent) are ordered
 //   deterministically by (Counter, Replica) so all replicas agree.
 // • Deletes: tombstones (Visible=false); we never physically remove nodes.
 // • Out-of-order: inserts buffer until their Parent arrives; deletes buffer
 //   until their Target arrives. Then they integrate deterministically.
 //
-// WHAT'S NEW IN THIS EDITION
-// --------------------------
-// We add a simple **visible order cache** to eliminate linear scans for
-// index-based edits:
-//   - `order []ID` holds all *visible* elements in DFS document order.
-//   - `orderIndex map[ID]int` gives O(1) lookup from ID -> position in order.
-// This turns `idByIndex(i)` into O(1) and makes `predecessorByIndex(i)` trivial.
+// WHAT'S NEW IN THIS EDITION (vs. the order-cached version)
+// ---------------------------------------------------------
+// We keep the *visible order* not as one big slice, but as a list of
+// **chunks** (fixed-capacity blocks). This removes O(n) tail shifts when
+// editing in the middle of long documents:
+//   - chunks:   [][]ID       — contiguous blocks of visible IDs
+//   - sizes:    []int        — length of each chunk
+//   - loc:      map[ID]pos   — where each visible ID lives (chunk, offset)
+//   - fenwick:  BIT over sizes for O(log C) prefix sums (find index → chunk)
 //
-// Other optimizations kept from the previous pass:
-//   - Binary insertion among siblings (no full re-sort of the slice).
-//   - Cached `Text()` with a dirty flag (rebuild only after changes).
-//   - `visibleCount` and `lastVisibleID` for quick length checks/appends.
-//   - Buffered deletes (`waitingDel`) for robust out-of-order streams.
+// Resulting complexities (n = visible length, C ≈ n/B):
+//   • Append insert .......... O(k)               (k = siblings after parent)
+//   • Middle insert/delete ... O(B + log C + k)   (local splice + split/merge)
+//   • idByIndex(i) ..........  O(log C)
+//   • Render Text() (dirty) .. O(n)               (iterate chunks)
+// We trade a tiny log factor for eliminating large tail copies.
 //
-// COMPLEXITY SNAPSHOT
-// -------------------
-// • Append insert:           O(k)    (k = #siblings after same parent)
-// • Middle insert by index:  O(k + A) where A is small ancestor/subtree walks
-//                              to find a predecessor; no full-document scan.
-// • Delete known:            O(1)    (plus O(n) slice splice in order)
-// • Render Text():           amortized O(n) (only when dirty)
-// • Index lookup:            O(1)    (via order cache)
-//
-// LIMITATIONS (intentional for learning)
-// --------------------------------------
-// • Per-rune granularity; no ropes/piece tables.
-// • Tombstones are not compacted.
-// • Finding the "last visible in a subtree" may walk that subtree (bounded,
-//   typically tiny for text; worst-case if many concurrent inserts at a point).
+// Still intentionally **simple**:
+//   - Binary insert among siblings; no fancy trees for children.
+//   - Per-rune elements; no ropes/piece tables.
+//   - No tombstone compaction (yet).
 //
 // See crdt_test.go for scenarios covering sequential edits, concurrency,
 // out-of-order deletes, and fast-path appends.
@@ -91,6 +83,60 @@ type InsertOp struct {
 type DeleteOp struct{ Target ID }
 
 // -----------------------------
+// Fenwick tree (Binary Indexed Tree) for chunk sizes
+// -----------------------------
+// Small, readable BIT; indices are 0-based externally, 1-based internally.
+
+type fenwick struct{ tree []int }
+
+func newFenwickFromSizes(sizes []int) *fenwick {
+	f := &fenwick{tree: make([]int, len(sizes)+1)}
+	for i, v := range sizes {
+		f.add(i, v)
+	}
+	return f
+}
+
+func (f *fenwick) add(i, delta int) { // 0-based
+	for i += 1; i < len(f.tree); i += i & -i {
+		f.tree[i] += delta
+	}
+}
+
+func (f *fenwick) prefixSum(i int) int { // sum of [0..i], 0-based
+	if i < 0 {
+		return 0
+	}
+	s := 0
+	for i += 1; i > 0; i -= i & -i {
+		s += f.tree[i]
+	}
+	return s
+}
+
+func (f *fenwick) total() int { return f.prefixSum(len(f.tree) - 2) }
+
+// find smallest idx with prefixSum(idx) > k (k is 0-based rank)
+func (f *fenwick) findByRank(k int) int {
+	sum := 0
+	idx := 0
+	// largest power of two <= len(tree)
+	bit := 1
+	for bit<<1 < len(f.tree) {
+		bit <<= 1
+	}
+	for bit > 0 {
+		next := idx + bit
+		if next < len(f.tree) && sum+f.tree[next] <= k {
+			sum += f.tree[next]
+			idx = next
+		}
+		bit >>= 1
+	}
+	return idx // 1-based predecessor; real index is idx (0-based) where prefix<=k
+}
+
+// -----------------------------
 // Document (one replica)
 // -----------------------------
 // Core state:
@@ -101,12 +147,18 @@ type DeleteOp struct{ Target ID }
 //   waitingDel: deletes waiting for a missing target
 //   head:       sentinel element before the first visible character
 //
-// Caches:
-//   order:        visible elements in DFS document order
-//   orderIndex:   ID -> index in order (only for visible elements)
-//   visibleCount: count of visible elements (len(order))
-//   lastVisibleID: cache of the last visible element (or invalidated)
-//   cachedText + dirty: lazy string rendering cache
+// CHUNKED visible order:
+//   chunks:     [][]ID       (concatenation is the visible order)
+//   sizes:      []int        (len of each chunk)
+//   fw:         Fenwick over sizes for O(log C) rank→chunk lookup
+//   loc:        map[ID]pos   (only for visible elements)
+//
+// Light caches:
+//   visibleCount: len of visible elements
+//   lastVisibleID/hasLast: tail cache for fast appends
+//   cachedText/dirty: render cache
+
+type pos struct{ c, off int }
 
 type Doc struct {
 	// identity/clock for minting fresh IDs
@@ -121,11 +173,13 @@ type Doc struct {
 	waitingDel map[ID][]DeleteOp
 	head       ID
 
-	// order cache
-	order      []ID
-	orderIndex map[ID]int
+	// chunked order
+	chunks [][]ID
+	sizes  []int
+	fw     *fenwick
+	loc    map[ID]pos
 
-	// light counters/caches
+	// light caches
 	visibleCount  int
 	lastVisibleID ID
 	hasLast       bool
@@ -133,6 +187,11 @@ type Doc struct {
 	cachedText string
 	dirty      bool
 }
+
+const (
+	chunkCap     = 256
+	lowWatermark = 64
+)
 
 // New constructs an empty document for a given replica and initializes caches.
 func New(replica string) *Doc {
@@ -145,14 +204,16 @@ func New(replica string) *Doc {
 		waiting:      make(map[ID][]InsertOp),
 		waitingDel:   make(map[ID][]DeleteOp),
 		head:         ID{Replica: "HEAD", Counter: 0},
-		order:        make([]ID, 0, 64),
-		orderIndex:   make(map[ID]int),
+		chunks:       make([][]ID, 0, 4),
+		sizes:        make([]int, 0, 4),
+		fw:           newFenwickFromSizes(nil),
+		loc:          make(map[ID]pos),
 		visibleCount: 0,
 		hasLast:      false,
 		cachedText:   "",
 		dirty:        false,
 	}
-	// HEAD sentinel exists but is invisible and never appears in order.
+	// HEAD sentinel exists but is invisible and never appears in chunks.
 	d.elems[d.head] = &Element{ID: d.head, Visible: false}
 	return d
 }
@@ -161,15 +222,17 @@ func New(replica string) *Doc {
 // Rendering / Linearization
 // -----------------------------
 
-// Text returns the user-visible string. We rebuild only when dirty.
-// With the order cache, rendering is just iterating the linear order.
+// Text returns the user-visible string. We rebuild only when dirty by
+// iterating the chunks in order.
 func (d *Doc) Text() string {
 	if !d.dirty {
 		return d.cachedText
 	}
 	var b strings.Builder
-	for _, id := range d.order {
-		b.WriteRune(d.elems[id].Value)
+	for _, ch := range d.chunks {
+		for _, id := range ch {
+			b.WriteRune(d.elems[id].Value)
+		}
 	}
 	d.cachedText = b.String()
 	d.dirty = false
@@ -217,7 +280,7 @@ func (d *Doc) LocalDelete(index int) (DeleteOp, bool) {
 // -----------------------------
 
 // ApplyInsert integrates an insertion. If the parent is unknown, buffer.
-// On success, we link into the tree AND splice into the visible order.
+// On success, we link into the tree AND splice into the visible chunks.
 func (d *Doc) ApplyInsert(op InsertOp) {
 	// 1) Ignore duplicate
 	if _, exists := d.elems[op.New.ID]; exists {
@@ -234,19 +297,32 @@ func (d *Doc) ApplyInsert(op InsertOp) {
 	d.elems[newElem.ID] = &newElem
 	// Link under parent, keep children sorted; remember parent
 	kids := d.children[op.Parent]
-	pos := searchInsertPos(kids, newElem.ID)
-	d.children[op.Parent] = spliceID(kids, pos, newElem.ID)
+	posKid := searchInsertPos(kids, newElem.ID)
+	d.children[op.Parent] = spliceID(kids, posKid, newElem.ID)
 	d.parentOf[newElem.ID] = op.Parent
 
 	// 4) Insert into visible order after its visible predecessor, if any
 	if newElem.Visible {
-		pred, hasPred := d.visiblePredecessorForNewChild(op.Parent, pos)
-		d.insertIntoOrderAfter(hasPred, pred, newElem.ID)
-		// update lightweight caches
+		pred, hasPred := d.visiblePredecessorForNewChild(op.Parent, posKid)
+		// translate predecessor to global index and insert right after
+		var insertIdx int
+		if hasPred {
+			p := d.loc[pred]
+			insertIdx = d.prefix(p.c) + p.off + 1
+		} else {
+			insertIdx = 0
+		}
+		d.insertAtIndex(insertIdx, newElem.ID)
+
+		// update light caches
 		d.visibleCount++
 		if d.visibleCount > 0 {
-			d.lastVisibleID = d.order[len(d.order)-1]
-			d.hasLast = true
+			// last visible is at the very end (last chunk/last off)
+			lastC := len(d.chunks) - 1
+			if lastC >= 0 && len(d.chunks[lastC]) > 0 {
+				d.lastVisibleID = d.chunks[lastC][len(d.chunks[lastC])-1]
+				d.hasLast = true
+			}
 		}
 		d.dirty = true
 	}
@@ -275,28 +351,25 @@ func (d *Doc) flushWaiting(parent ID) {
 }
 
 // ApplyDelete marks the target invisible; if unknown, buffer it.
-// When making an element invisible, we also remove it from `order`.
+// When making an element invisible, we also remove it from the chunks.
 func (d *Doc) ApplyDelete(op DeleteOp) {
 	if e, ok := d.elems[op.Target]; ok {
 		if e.Visible {
-			// remove from order
-			if idx, ok2 := d.orderIndex[op.Target]; ok2 {
-				d.order = spliceOut(d.order, idx)
-				delete(d.orderIndex, op.Target)
-				// fix indices for elements after idx
-				for i := idx; i < len(d.order); i++ {
-					d.orderIndex[d.order[i]] = i
-				}
-				// update last-visible cache
-				if len(d.order) > 0 {
-					d.lastVisibleID = d.order[len(d.order)-1]
-					d.hasLast = true
-				} else {
-					d.hasLast = false
-				}
+			if p, ok2 := d.loc[op.Target]; ok2 {
+				d.deleteAtChunkPos(p.c, p.off)
 			}
 			e.Visible = false
 			d.visibleCount--
+			// update tail cache
+			if d.visibleCount == 0 {
+				d.hasLast = false
+			} else {
+				lastC := len(d.chunks) - 1
+				if lastC >= 0 && len(d.chunks[lastC]) > 0 {
+					d.lastVisibleID = d.chunks[lastC][len(d.chunks[lastC])-1]
+					d.hasLast = true
+				}
+			}
 			d.dirty = true
 		}
 		return
@@ -306,42 +379,210 @@ func (d *Doc) ApplyDelete(op DeleteOp) {
 }
 
 // -----------------------------
-// Order-cache helpers
+// Order-chunk helpers
 // -----------------------------
 
-// insertIntoOrderAfter splices id into d.order right after pred.
-// If hasPred==false, inserts at the beginning.
-func (d *Doc) insertIntoOrderAfter(hasPred bool, pred ID, id ID) {
-	var pos int
-	if hasPred {
-		p := d.orderIndex[pred]
-		pos = p + 1
-	} else {
-		pos = 0
+// prefix returns total size of chunks[0..c-1].
+func (d *Doc) prefix(c int) int {
+	if d.fw == nil {
+		return 0
 	}
-	d.order = spliceID(d.order, pos, id)
-	// rebuild index for tail
-	for i := pos; i < len(d.order); i++ {
-		d.orderIndex[d.order[i]] = i
+	return d.fw.prefixSum(c - 1)
+}
+
+// findChunkByIndex returns (chunkIndex, offset) for global index i.
+func (d *Doc) findChunkByIndex(i int) (int, int) {
+	// fenwick.findByRank finds the largest index with prefix <= i-1
+	c := d.fw.findByRank(i) // returns predecessor index of cumulative sum
+	// The first chunk that pushes sum above i is c+1 in 1-based sense, but with
+	// our implementation, c is already the chunk index (0-based) whose prefix <= i.
+	// Compute offset as i - prefix(c-1).
+	off := i - d.prefix(c)
+	return c, off
+}
+
+// insertAtIndex inserts id into the global visible order at index i.
+func (d *Doc) insertAtIndex(i int, id ID) {
+	// empty structure fast-path
+	if len(d.chunks) == 0 {
+		d.chunks = append(d.chunks, []ID{id})
+		d.sizes = append(d.sizes, 1)
+		d.fw = newFenwickFromSizes(d.sizes)
+		d.loc[id] = pos{c: 0, off: 0}
+		return
+	}
+	if i < 0 {
+		i = 0
+	}
+	if i > d.visibleCount {
+		i = d.visibleCount
+	}
+	c, off := d.findChunkByIndex(i)
+	// splice into chunk c at off
+	d.chunks[c] = spliceID(d.chunks[c], off, id)
+	d.sizes[c]++
+	d.fw.add(c, 1)
+	// fix loc for elements after off in chunk c
+	for j := off; j < len(d.chunks[c]); j++ {
+		d.loc[d.chunks[c][j]] = pos{c: c, off: j}
+	}
+	// handle split if over capacity
+	if len(d.chunks[c]) > chunkCap {
+		d.splitChunk(c)
 	}
 }
 
+// deleteAtChunkPos removes element at (c, off) from chunks and maintains aux.
+func (d *Doc) deleteAtChunkPos(c, off int) {
+	id := d.chunks[c][off]
+	// remove from chunk
+	d.chunks[c] = spliceOut(d.chunks[c], off)
+	d.sizes[c]--
+	d.fw.add(c, -1)
+	delete(d.loc, id)
+	// fix loc for trailing elements in this chunk
+	for j := off; j < len(d.chunks[c]); j++ {
+		d.loc[d.chunks[c][j]] = pos{c: c, off: j}
+	}
+	// merge/rebalance if too small
+	if len(d.chunks[c]) < lowWatermark {
+		d.rebalanceAround(c)
+	}
+	// if chunk becomes empty, remove it
+	if len(d.chunks[c]) == 0 {
+		d.removeChunk(c)
+	}
+}
+
+// splitChunk splits chunk c into two roughly equal halves.
+func (d *Doc) splitChunk(c int) {
+	old := d.chunks[c]
+	mid := len(old) / 2
+	left := old[:mid]
+	right := append([]ID(nil), old[mid:]...)
+	// replace c with left, insert right after
+	d.chunks[c] = left
+	d.chunks = append(d.chunks, nil)
+	copy(d.chunks[c+1:], d.chunks[c:])
+	d.chunks[c+1] = right
+	// sizes & fenwick
+	d.sizes[c] = len(left)
+	d.sizes = append(d.sizes, 0)
+	copy(d.sizes[c+1:], d.sizes[c:])
+	d.sizes[c+1] = len(right)
+	d.fw = newFenwickFromSizes(d.sizes)
+	// fix loc for moved elements (both chunks)
+	for j := 0; j < len(d.chunks[c]); j++ {
+		d.loc[d.chunks[c][j]] = pos{c: c, off: j}
+	}
+	for j := 0; j < len(d.chunks[c+1]); j++ {
+		d.loc[d.chunks[c+1][j]] = pos{c: c + 1, off: j}
+	}
+}
+
+// rebalanceAround tries to merge c with a neighbor or rebalance with it.
+func (d *Doc) rebalanceAround(c int) {
+	// try merge with next
+	if c+1 < len(d.chunks) {
+		if len(d.chunks[c])+len(d.chunks[c+1]) <= chunkCap {
+			// merge into c
+			d.chunks[c] = append(d.chunks[c], d.chunks[c+1]...)
+			// fix loc for moved elements
+			for j := 0; j < len(d.chunks[c]); j++ {
+				d.loc[d.chunks[c][j]] = pos{c: c, off: j}
+			}
+			// remove c+1
+			d.removeChunk(c + 1)
+			// adjust sizes/fenwick
+			d.sizes[c] = len(d.chunks[c])
+			d.fw = newFenwickFromSizes(d.sizes)
+			return
+		} else {
+			// rebalance roughly half-half
+			total := len(d.chunks[c]) + len(d.chunks[c+1])
+			target := total / 2
+			if len(d.chunks[c]) < target {
+				move := target - len(d.chunks[c])
+				// take from front of next
+				d.chunks[c] = append(d.chunks[c], d.chunks[c+1][:move]...)
+				d.chunks[c+1] = d.chunks[c+1][move:]
+			} else if len(d.chunks[c]) > target {
+				move := len(d.chunks[c]) - target
+				// move tail to front of next
+				tail := d.chunks[c][len(d.chunks[c])-move:]
+				d.chunks[c] = d.chunks[c][:len(d.chunks[c])-move]
+				d.chunks[c+1] = append(append([]ID(nil), tail...), d.chunks[c+1]...)
+			}
+			// fix loc both chunks
+			for j := 0; j < len(d.chunks[c]); j++ {
+				d.loc[d.chunks[c][j]] = pos{c: c, off: j}
+			}
+			for j := 0; j < len(d.chunks[c+1]); j++ {
+				d.loc[d.chunks[c+1][j]] = pos{c: c + 1, off: j}
+			}
+			// sizes/fenwick
+			d.sizes[c] = len(d.chunks[c])
+			d.sizes[c+1] = len(d.chunks[c+1])
+			d.fw = newFenwickFromSizes(d.sizes)
+			return
+		}
+	}
+	// else try merge with previous
+	if c-1 >= 0 {
+		if len(d.chunks[c-1])+len(d.chunks[c]) <= chunkCap {
+			// merge into c-1
+			d.chunks[c-1] = append(d.chunks[c-1], d.chunks[c]...)
+			for j := 0; j < len(d.chunks[c-1]); j++ {
+				d.loc[d.chunks[c-1][j]] = pos{c: c - 1, off: j}
+			}
+			d.removeChunk(c)
+			d.sizes[c-1] = len(d.chunks[c-1])
+			d.fw = newFenwickFromSizes(d.sizes)
+			return
+		}
+	}
+}
+
+// removeChunk deletes chunk at index c.
+func (d *Doc) removeChunk(c int) {
+	if c < 0 || c >= len(d.chunks) {
+		return
+	}
+	// remove from chunks
+	copy(d.chunks[c:], d.chunks[c+1:])
+	d.chunks = d.chunks[:len(d.chunks)-1]
+	// remove from sizes
+	copy(d.sizes[c:], d.sizes[c+1:])
+	d.sizes = d.sizes[:len(d.sizes)-1]
+	// rebuild fenwick
+	d.fw = newFenwickFromSizes(d.sizes)
+	// fix loc for chunks after c
+	for ci := c; ci < len(d.chunks); ci++ {
+		for j := 0; j < len(d.chunks[ci]); j++ {
+			d.loc[d.chunks[ci][j]] = pos{c: ci, off: j}
+		}
+	}
+}
+
+// -----------------------------
+// Visible predecessor logic for DFS order
+// -----------------------------
+
 // visiblePredecessorForNewChild determines the visible element that should
-// precede a new child being inserted under `parent` at child index `pos`.
+// precede a new child being inserted under `parent` at child index `posKid`.
 // Rules under DFS order (node before its subtree):
 //   - If there is a previous sibling, predecessor is the **last visible**
 //     element inside that sibling's subtree.
 //   - Else, predecessor is the nearest **visible** ancestor (walk up parents).
 //
 // If none exists (e.g., empty document), we return false.
-func (d *Doc) visiblePredecessorForNewChild(parent ID, pos int) (ID, bool) {
+func (d *Doc) visiblePredecessorForNewChild(parent ID, posKid int) (ID, bool) {
 	// previous sibling case
-	if pos > 0 {
-		prev := d.children[parent][pos-1]
+	if posKid > 0 {
+		prev := d.children[parent][posKid-1]
 		if id, ok := d.lastVisibleInSubtree(prev); ok {
 			return id, true
 		}
-		// If the previous sibling subtree has no visible nodes (rare), fall back to ancestor path.
 	}
 	// walk up to find nearest visible ancestor
 	cur := parent
@@ -381,14 +622,15 @@ func (d *Doc) lastVisibleInSubtree(root ID) (ID, bool) {
 }
 
 // -----------------------------
-// Index helpers (O(1) via order cache)
+// Index helpers (logarithmic via chunks)
 // -----------------------------
 
 func (d *Doc) idByIndex(index int) (ID, bool) {
-	if index < 0 || index >= len(d.order) {
+	if index < 0 || index >= d.visibleCount {
 		return ID{}, false
 	}
-	return d.order[index], true
+	c, off := d.findChunkByIndex(index)
+	return d.chunks[c][off], true
 }
 
 // predecessorByIndex: index==0 => HEAD; otherwise predecessor is element at index-1.
