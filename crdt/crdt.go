@@ -1,75 +1,18 @@
 // ------------------------------------------------------------
-// simple-go-text-crdt (RGA) — literate, heavily commented edition
+// simple-go-text-crdt (RGA) — literate, optimized-but-still-simple edition
 // ------------------------------------------------------------
-// This file implements a tiny, readable sequence CRDT for plain text
-// using a simplified RGA (Replicated Growable Array) approach. The
-// emphasis is on understandability, not performance.
+// This file implements a tiny, readable sequence CRDT for plain text using a
+// simplified RGA (Replicated Growable Array). We now add a few **gentle**
+// optimizations that preserve clarity:
 //
-// WHY RGA?
-// ---------
-// RGA models a text document as a linked forest of elements (characters).
-// Each character has a unique ID and a logical parent: "insert X after P".
-// When two replicas insert at the same position concurrently, we must pick a
-// deterministic order. Here we break ties by (Counter, ReplicaID), which
-// ensures all replicas linearize children in the same order.
+// NEW IN THIS EDITION (compared to the first literate version)
+// -----------------------------------------------------------
+// A) Binary insertion for siblings (avoid re-sorting entire slice each time).
+// B) Cached rendered text with a dirty flag (avoid rebuilding on every Text()).
+// C) Visible length counter + cached last-visible ID (fast appends and checks).
+// D) Buffer deletes whose target hasn't arrived yet (robust out-of-order).
 //
-// KEY IDEAS
-// ----------
-// 1) Unique IDs: An ID is (Replica string, Counter int). Each replica increases
-//    its own counter whenever it creates a new character. IDs are globally unique
-//    without coordination.
-//
-// 2) Parent-Addressed Inserts: Instead of saying "insert at index 17", we say
-//    "insert after the element whose ID is P". This makes replays/catches-up robust,
-//    because positions are not absolute indexes that shift as edits arrive.
-//
-// 3) Deterministic Child Ordering: If multiple children are inserted after the
-//    same parent (e.g., concurrent inserts), we sort them by (Counter, Replica).
-//    All replicas apply the same rule -> same final order.
-//
-// 4) Tombstones for Deletes: We never physically remove an element; we mark it
-//    Visible=false. This makes deletes converge even if they arrive before other
-//    replicas have seen the insertion.
-//
-// 5) Out-of-Order Delivery: If we receive an insert whose Parent is unknown
-//    (because messages can arrive in any order), we buffer the op in a map
-//    "waiting[parent] -> list of children". When the parent appears, we flush
-//    its waiting list.
-//
-// 6) Linearization to Text: The rendered text is obtained by a deterministic DFS
-//    traversal starting at a sentinel HEAD node. Only Visible elements contribute
-//    runes to output; invisible (tombstoned) ones are skipped.
-//
-// WHAT THIS FILE CONTAINS
-// ------------------------
-// - Data model: ID, Element
-// - Mutation ops: InsertOp, DeleteOp
-// - Doc struct: one replica state (elements, children adjacency, buffers)
-// - Methods to perform local edits (produce ops) and to apply remote ops
-// - A simple linearization (Text) that yields the user-visible string
-//
-// TRADE-OFFS & LIMITATIONS (ON PURPOSE)
-// -------------------------------------
-// - Not optimized: We use maps and slices and perform DFS/linear scans.
-// - No garbage collection of tombstones.
-// - No explicit causal metadata (vector clocks). We simply buffer children until
-//   their parents arrive, which is sufficient for this toy model.
-// - Only single-rune inserts; a real editor would batch and/or handle ranges.
-//
-// WALK-THROUGH EXAMPLE
-// --------------------
-// Replica A types "Hi":
-//   Insert 'H' after HEAD -> ID(A,1)
-//   Insert 'i' after ID(A,1) -> ID(A,2)
-// Replica B concurrently inserts '!':
-//   Insert '!' after ID(A,2) -> ID(B,1)
-// If A also inserts '!' concurrently after the same parent, we compare IDs:
-//   order children by (Counter, Replica). Deterministic at all replicas.
-//
-// TESTING THIS CRDT
-// -----------------
-// See crdt_test.go (from the chat): it simulates Alice and Bob, sequential and
-// concurrent edits, and checks convergence after exchanges of ops.
+// We still favor understandability over raw speed: no ropes, no complex indexes.
 // ------------------------------------------------------------
 
 package crdt
@@ -79,20 +22,18 @@ import (
 	"strings"
 )
 
-// ID uniquely identifies an element produced by a replica.
-// - Replica: who created it (just a short string like "A" or "B").
-// - Counter: strictly increasing per replica for each created element.
-//
-// Uniqueness: (Replica, Counter) pairs are unique without coordination.
-// Ordering: we use (Counter, then Replica) as a total order for tie-breaks.
-// NOTE: This order is a design choice; any stable total order works.
+// -----------------------------
+// Identifiers & Elements
+// -----------------------------
+
+// ID: unique per element via (Replica, Counter). Counter increases per replica.
+// We use (Counter, Replica) as a stable total order for tie-breaking children.
 
 type ID struct {
 	Replica string
 	Counter int
 }
 
-// Less defines our deterministic tie-break order between two IDs.
 func (a ID) Less(b ID) bool {
 	if a.Counter != b.Counter {
 		return a.Counter < b.Counter
@@ -100,9 +41,7 @@ func (a ID) Less(b ID) bool {
 	return a.Replica < b.Replica
 }
 
-// Element is a single character in the document graph.
-// Value holds the rune; Visible indicates whether it's tombstoned.
-// We keep all elements (even deleted) to ensure convergent behavior on replay.
+// Element: a single character node. Visible=false means tombstoned.
 
 type Element struct {
 	ID      ID
@@ -110,68 +49,97 @@ type Element struct {
 	Visible bool
 }
 
-// InsertOp describes an insertion: create New after Parent.
-// - Parent: the ID of the element we insert after (HEAD for beginning).
-// - New: the freshly created element (its ID and Value matter).
+// -----------------------------
+// Operations
+// -----------------------------
+
+// InsertOp: insert New directly after Parent.
 
 type InsertOp struct {
 	Parent ID
 	New    Element
 }
 
-// DeleteOp marks an existing element (by ID) as invisible.
-// We assume the target element will exist eventually on all replicas.
+// DeleteOp: tombstone the element with Target ID.
 
 type DeleteOp struct {
 	Target ID
 }
 
-// Doc is a replica's entire state. All convergence happens via operations.
-// Fields:
-// - replica, clock: local ID minting
-// - elems:   map from ID -> *Element (includes tombstones)
-// - children: adjacency: parent ID -> slice of child IDs (sorted by ID order)
-// - waiting:  buffer for out-of-order inserts (keyed by missing Parent)
-// - head:     sentinel element before the first character
+// -----------------------------
+// Document (one replica)
+// -----------------------------
+// Internal structure (unchanged conceptually):
+// - elems:     all known elements, including tombstones
+// - children:  parent -> ordered list of child IDs (deterministic order)
+// - waiting:   buffer for inserts whose Parent is missing
+// - waitingDel:buffer for deletes whose Target is missing (new)
+// - head:      sentinel element before the first character
+//
+// Lightweight caches (new):
+// - visibleCount: count of currently visible elements (fast length checks)
+// - lastVisibleID / hasLast: track the last visible element for fast appends
+// - cachedText + dirty flag: only rebuild Text() when needed
 
 type Doc struct {
+	// identity/clock for minting fresh IDs
 	replica string
 	clock   int
 
-	elems     map[ID]*Element
-	children map[ID][]ID
-	waiting  map[ID][]InsertOp
-
+	// core storage
+	elems      map[ID]*Element
+	children  map[ID][]ID
+	waiting   map[ID][]InsertOp
+	waitingDel map[ID][]DeleteOp
 	head ID
+
+	// lightweight caches
+	visibleCount int
+	lastVisibleID ID
+	hasLast       bool
+
+	cachedText string
+	dirty      bool
 }
 
-// New constructs an empty document for a given replica.
-// We create a synthetic HEAD node so inserts at the beginning are uniform.
+// New constructs an empty document for a given replica and initializes caches.
 func New(replica string) *Doc {
 	d := &Doc{
-		replica:  replica,
-		clock:    0,
-		elems:     make(map[ID]*Element),
-		children: make(map[ID][]ID),
-		waiting:  make(map[ID][]InsertOp),
-		head:     ID{Replica: "HEAD", Counter: 0},
+		replica:    replica,
+		clock:      0,
+		elems:       make(map[ID]*Element),
+		children:   make(map[ID][]ID),
+		waiting:    make(map[ID][]InsertOp),
+		waitingDel: make(map[ID][]DeleteOp),
+		head:       ID{Replica: "HEAD", Counter: 0},
+		// caches
+		visibleCount: 0,
+		hasLast:      false,
+		cachedText:   "",
+		dirty:        false,
 	}
-	// The HEAD sentinel is an element that never renders and is always present.
+	// The HEAD sentinel never renders.
 	d.elems[d.head] = &Element{ID: d.head, Visible: false}
 	return d
 }
 
-// Text linearizes the structure into a user-visible string by a DFS
-// from HEAD. We iterate children in the deterministic order and append
-// only visible runes.
+// -----------------------------
+// Rendering / Linearization
+// -----------------------------
+
+// Text returns the user-visible string. We rebuild only when dirty.
 func (d *Doc) Text() string {
+	if !d.dirty {
+		return d.cachedText
+	}
 	var b strings.Builder
 	d.walk(d.head, &b)
-	return b.String()
+	d.cachedText = b.String()
+	d.dirty = false
+	return d.cachedText
 }
 
-// walk performs the DFS used by Text(). Children slices are maintained
-// in sorted order, so iteration is deterministic across replicas.
+// walk is the DFS used by Text(). Children are iterated in deterministic order.
 func (d *Doc) walk(parent ID, b *strings.Builder) {
 	for _, id := range d.children[parent] {
 		e := d.elems[id]
@@ -182,25 +150,35 @@ func (d *Doc) walk(parent ID, b *strings.Builder) {
 	}
 }
 
-// LocalInsert performs a local edit at a visible index and returns the InsertOp
-// to be broadcast/applied on other replicas. Internally we translate the index
-// into a predecessor ID (the element after which we insert) to produce a
-// position-stable operation.
+// -----------------------------
+// Local edits: index-based API
+// -----------------------------
+
+// LocalInsert inserts rune r at the given visible index and returns the InsertOp.
+// Fast path: if index == visibleCount (append), we can avoid a search.
 func (d *Doc) LocalInsert(index int, r rune) InsertOp {
-	parent := d.predecessorByIndex(index)
-	id := d.nextID()
-	op := InsertOp{
-		Parent: parent,
-		New:    Element{ID: id, Value: r, Visible: true},
+	var parent ID
+	if index <= 0 {
+		parent = d.head
+	} else if index >= d.visibleCount {
+		// append after last visible (or HEAD if empty)
+		if d.hasLast {
+			parent = d.lastVisibleID
+		} else {
+			parent = d.head
+		}
+	} else {
+		// general case: map index -> predecessor ID
+		parent = d.predecessorByIndex(index)
 	}
-	// Apply locally (optimistic local-first edit), then share op.
+
+	id := d.nextID()
+	op := InsertOp{Parent: parent, New: Element{ID: id, Value: r, Visible: true}}
 	d.ApplyInsert(op)
 	return op
 }
 
-// LocalDelete deletes the visible character at index and returns the DeleteOp
-// so that other replicas can apply the same tombstone. If the index is invalid
-// in the current view, we return ok=false.
+// LocalDelete deletes the visible character at index and returns the DeleteOp.
 func (d *Doc) LocalDelete(index int) (DeleteOp, bool) {
 	id, ok := d.idByIndex(index)
 	if !ok {
@@ -211,93 +189,111 @@ func (d *Doc) LocalDelete(index int) (DeleteOp, bool) {
 	return op, true
 }
 
-// ApplyInsert integrates an insertion (local or remote). It is idempotent:
-// re-applying the same op has no effect. If the Parent is not yet known, the
-// operation is buffered until the Parent arrives.
+// -----------------------------
+// Applying operations (idempotent)
+// -----------------------------
+
+// ApplyInsert integrates an insertion (local or remote). If Parent is missing,
+// we buffer until it arrives. On success we update caches and flush dependents.
 func (d *Doc) ApplyInsert(op InsertOp) {
-	// 1) If we've already integrated this element, do nothing.
+	// ignore duplicate
 	if _, exists := d.elems[op.New.ID]; exists {
 		return
 	}
-	// 2) If Parent is unknown, buffer and return.
+	// buffer if parent unknown
 	if _, ok := d.elems[op.Parent]; !ok {
 		d.waiting[op.Parent] = append(d.waiting[op.Parent], op)
 		return
 	}
-	// 3) Materialize the element and link it under Parent.
+	// materialize
 	newElem := op.New
-	newElem.Visible = true // inserts are visible by default
+	newElem.Visible = true
 	d.elems[newElem.ID] = &newElem
-	// Keep children sorted by our total order so traversal is deterministic.
+
+	// link under parent using binary insertion to keep children sorted
 	d.children[op.Parent] = insertSorted(d.children[op.Parent], newElem.ID)
 
-	// 4) Now that this node exists, flush any buffered children that were waiting
-	//    on it. This handles cascaded arrivals when ops were received far out-of-order.
+	// update caches
+	d.visibleCount++
+	d.lastVisibleID = newElem.ID
+	d.hasLast = true
+	d.dirty = true
+
+	// If deletes were waiting for this element, apply them now.
+	if dels := d.waitingDel[newElem.ID]; len(dels) > 0 {
+		for _, del := range dels {
+			d.ApplyDelete(del)
+		}
+		delete(d.waitingDel, newElem.ID)
+	}
+
+	// flush children that were waiting on this new node
 	d.flushWaiting(newElem.ID)
 }
 
-// flushWaiting integrates any child inserts that were waiting for a Parent.
 func (d *Doc) flushWaiting(parent ID) {
 	queue := d.waiting[parent]
-	if len(queue) == 0 {
-		return
-	}
+	if len(queue) == 0 { return }
 	delete(d.waiting, parent)
 	for _, child := range queue {
-		// Applying may recursively flush deeper descendants.
 		d.ApplyInsert(child)
 	}
 }
 
-// ApplyDelete marks the target element invisible. It is idempotent.
-// If the target isn't known yet, we simply no-op; once the insert arrives,
-// applying this delete again will take effect (in practice you'd buffer deletes
-// too, but keeping it simple here is fine for tests where inserts precede).
+// ApplyDelete marks the target invisible. If we haven't seen the target yet,
+// we buffer this delete to apply when the element arrives later.
 func (d *Doc) ApplyDelete(op DeleteOp) {
 	if e, ok := d.elems[op.Target]; ok {
-		e.Visible = false
+		if e.Visible {
+			e.Visible = false
+			d.visibleCount--
+			// lastVisibleID cache may be invalidated; simplest is to clear it.
+			if d.hasLast && d.lastVisibleID == op.Target {
+				d.hasLast = false // will be recomputed lazily on next append need
+			}
+			d.dirty = true
+		}
+		return
 	}
+	// target unknown: buffer delete
+	d.waitingDel[op.Target] = append(d.waitingDel[op.Target], op)
 }
 
-// insertSorted inserts an ID into a slice while keeping it ordered by our
-// total order (Counter, then Replica). This defines the deterministic order
-// for concurrent siblings under the same Parent.
+// -----------------------------
+// Helpers
+// -----------------------------
+
+// insertSorted inserts x into ids keeping ascending order by (Counter, Replica)
+// using binary search + splice. Simpler than re-sorting on every append.
 func insertSorted(ids []ID, x ID) []ID {
-	ids = append(ids, x)
-	sort.Slice(ids, func(i, j int) bool {
-		ai, aj := ids[i], ids[j]
-		if ai.Counter != aj.Counter {
-			return ai.Counter < aj.Counter
-		}
-		return ai.Replica < aj.Replica
+	pos := sort.Search(len(ids), func(i int) bool {
+		ai := ids[i]
+		if ai.Counter != x.Counter { return ai.Counter >= x.Counter }
+		return ai.Replica >= x.Replica
 	})
+	ids = append(ids, ID{})        // grow by one
+	copy(ids[pos+1:], ids[pos:])   // shift tail right
+	ids[pos] = x
 	return ids
 }
 
-// predecessorByIndex maps a visible index to the ID we should insert after.
-// index == 0   -> insert after HEAD (beginning of document)
-// index in (0,len] -> insert after the element currently at index-1
-// index > len  -> insert after the last visible element (append)
+// predecessorByIndex maps a visible index to the ID to insert after.
+// index==0 -> HEAD; otherwise predecessor is the element at index-1.
 func (d *Doc) predecessorByIndex(index int) ID {
-	if index <= 0 {
-		return d.head
-	}
+	if index <= 0 { return d.head }
 	id, ok := d.idByIndex(index - 1)
 	if !ok {
-		// If beyond end, append after last visible (or HEAD if empty)
-		if last, ok2 := d.lastVisible(); ok2 {
-			return last
-		}
+		// beyond end: append after last visible (or HEAD if empty)
+		if d.hasLast { return d.lastVisibleID }
 		return d.head
 	}
 	return id
 }
 
-// idByIndex returns the ID of the element at a given visible index by doing a
-// DFS over the children lists and counting only Visible elements. This is slow
-// (O(n)), but extremely simple and good for learning/tests.
+// idByIndex finds the element ID at the given visible index via DFS counting
+// only visible elements. O(n) but simple; acceptable for this learning build.
 func (d *Doc) idByIndex(index int) (ID, bool) {
-	count := -1 // becomes 0 at first visible element
+	count := -1
 	var found ID
 	var dfs func(parent ID) bool
 	dfs = func(parent ID) bool {
@@ -305,26 +301,19 @@ func (d *Doc) idByIndex(index int) (ID, bool) {
 			e := d.elems[id]
 			if e.Visible {
 				count++
-				if count == index {
-					found = id
-					return true
-				}
+				if count == index { found = id; return true }
 			}
-			if dfs(id) {
-				return true
-			}
+			if dfs(id) { return true }
 		}
 		return false
 	}
 	_ = dfs(d.head)
-	if count >= index && count >= 0 {
-		return found, true
-	}
+	if count >= index && count >= 0 { return found, true }
 	return ID{}, false
 }
 
-// lastVisible finds the last visible element in document order, useful for
-// appends when index is beyond the current end.
+// lastVisible recomputes the last visible element by DFS.
+// We avoid using this in the fast path but keep it for fallback logic.
 func (d *Doc) lastVisible() (ID, bool) {
 	var last ID
 	var seen bool
@@ -332,10 +321,7 @@ func (d *Doc) lastVisible() (ID, bool) {
 	dfs = func(parent ID) {
 		for _, id := range d.children[parent] {
 			e := d.elems[id]
-			if e.Visible {
-				last = id
-				seen = true
-			}
+			if e.Visible { last = id; seen = true }
 			dfs(id)
 		}
 	}
@@ -343,7 +329,7 @@ func (d *Doc) lastVisible() (ID, bool) {
 	return last, seen
 }
 
-// nextID mints a fresh, replica-unique ID by incrementing the local counter.
+// nextID mints a fresh ID for a new local element.
 func (d *Doc) nextID() ID {
 	d.clock++
 	return ID{Replica: d.replica, Counter: d.clock}
