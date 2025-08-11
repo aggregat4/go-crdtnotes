@@ -392,13 +392,18 @@ func (d *Doc) prefix(c int) int {
 
 // findChunkByIndex returns (chunkIndex, offset) for global index i.
 func (d *Doc) findChunkByIndex(i int) (int, int) {
-	// fenwick.findByRank finds the largest index with prefix <= i-1
-	c := d.fw.findByRank(i) // returns predecessor index of cumulative sum
-	// The first chunk that pushes sum above i is c+1 in 1-based sense, but with
-	// our implementation, c is already the chunk index (0-based) whose prefix <= i.
-	// Compute offset as i - prefix(c-1).
-	off := i - d.prefix(c)
-	return c, off
+    // fenwick.findByRank returns j in [0..len(chunks)] such that prefix(j) <= i,
+    // where prefix(j) is the sum of sizes[0..j-1]. If j == len(chunks), we are
+    // inserting at the very end: choose the last chunk and place at its tail.
+    j := d.fw.findByRank(i)
+    if j >= len(d.chunks) {
+        c := len(d.chunks) - 1
+        off := i - d.prefix(c)
+        return c, off
+    }
+    c := j
+    off := i - d.prefix(c)
+    return c, off
 }
 
 // insertAtIndex inserts id into the global visible order at index i.
