@@ -43,3 +43,44 @@
       - On op application: apply to `Doc` first, then persist within a tx; or vice versa depending on durability needs.
       - On startup: load from storage to construct `Doc` (or replay ops).
     - Testing: mock interfaces for unit tests; integration tests run against SQLite (in-memory DB).
+
+- [] Realtime sync via WebSockets (server peer)
+  - Architecture (clean separation):
+    - Domain: `crdt` (unchanged)
+    - Persistence port: `storage` interfaces; adapter `storage/sqlite`
+    - Transport port: `transport` interfaces; adapter `transport/ws`
+    - Orchestration: `sync` package (ties `Doc` + `storage` + `transport`); no SQL/WS in `crdt`
+    - Server: `server/ws` hub that relays ops per `docID`; optional server store/oplog
+  - Transport interface (port):
+    - `Connect(ctx, docID, authToken) error`, `Close() error`
+    - `SendOps(ctx, docID, ops []CRDTOp) error`, `SendWatermarks(ctx, docID, have map[string]int) error`
+    - `RequestSnapshot(ctx, docID) error`, `OnMessage(fn func(Message))`
+    - `Message{ Type:"ops"|"ack"|"snapshot"|"presence"|"hello", Ops []CRDTOp, Snapshot, Watermark }`
+  - Wire protocol (JSON over WS):
+    - `hello { docId, replica, have:{replica:maxCounter} }`
+    - `ops { docId, ops:[{kind:"insert"|"delete", ...}] }`
+    - `snapshotRequest { docId }`, `snapshot { runs, edges, tombstones, watermark }`
+    - `presence { ... }`, `ack { ... }`
+  - Client flow (`sync.Replicator`):
+    - Startup: open SQLite → build `Doc`; connect WS → send `hello(have)` from `Store.MaxCountersByReplica()`
+    - Local edit: `Doc.Local*` → apply to `Doc` and `Store` → batch `SendOps`
+    - Incoming `ops`: persist to `Store`, apply to `Doc` (idempotent, out-of-order ok)
+    - Incoming `snapshot`: transactional replace of `Store` + rebuild `Doc`
+    - Reconnect: resend `hello(have)`; server backfills only missing ops
+    - Pending: periodically retry `Store.ListPending()`
+  - Server responsibilities:
+    - Auth; room per `docId`; fanout ops to all clients
+    - Catch-up: replay from oplog by server sequence or select by watermarks; else send snapshot
+    - Optional persistence: store ops/snapshots for durability and late joiners
+    - Presence: separate channel/type from document ops
+  - Ordering, causality, idempotency:
+    - No total order required; CRDT resolves by ID order
+    - Parents may arrive later; clients buffer via `waiting`/`waitingDel`
+    - Idempotency by `(replica,counter)` keys in both `Doc` and SQLite PKs
+  - Persistence interplay (client):
+    - Apply ops to `Store` and `Doc`; on snapshot, rebuild `Store` within a tx then re-init `Doc`
+    - Persist watermarks/server resume tokens (if any) in `meta`
+    - Crash-safe: resume from SQLite and `have` on reconnect
+  - Health, batching, security:
+    - Heartbeats/`ping` frames, exponential backoff, bounded batches
+    - TLS; auth token per connection; rate limits; size limits per message
