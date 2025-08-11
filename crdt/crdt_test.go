@@ -7,11 +7,6 @@ func applyAllInserts(dst *Doc, ops []InsertOp) {
 		dst.ApplyInsert(op)
 	}
 }
-func applyAllDeletes(dst *Doc, ops []DeleteOp) {
-	for _, op := range ops {
-		dst.ApplyDelete(op)
-	}
-}
 
 func TestAliceBobSequentialAndConcurrent(t *testing.T) {
 	alice := New("A")
