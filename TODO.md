@@ -84,3 +84,22 @@
   - Health, batching, security:
     - Heartbeats/`ping` frames, exponential backoff, bounded batches
     - TLS; auth token per connection; rate limits; size limits per message
+
+- [] TUI client (Bubble Tea architecture)
+  - Stack: Bubble Tea (model/update/view), Bubbles (textarea/viewport), Lip Gloss for styling
+  - Separation: `ui` package only depends on `sync` (for events) and exposes UI Msgs/Cmds; no SQL/WS/CRDT logic in `ui`
+  - Data flow:
+    - Model holds derived view state: current text viewport, local cursor/selection (anchor-based), remote presence, status
+    - Msgs: key/mouse input, transport ops from `sync.Replicator`, presence updates, storage acks, ticks
+    - Cmds: dispatch local edits (produce CRDT ops via `sync`), request snapshot, throttle/batch sends, load/save
+  - Components:
+    - Editor: `textarea` or `viewport` over `Doc.Text()`; resolve anchors to indices for cursors; render remote cursors as colored spans
+    - Panels: status bar (conn state, lag), optional side panel for participants
+  - Integration:
+    - `sync.Replicator` provides a channel/callback → convert to UI Msgs
+    - Local edits: translate key events to CRDT operations, apply immediately (optimistic), let `sync` send/batch
+  - Performance:
+    - Maintain viewport; avoid rebuilding full text each frame; only when CRDT `dirty` flips
+    - Coalesce redraws; debounce expensive operations; reuse buffers
+  - Theming & keymaps: centralize key bindings; light/dark themes with Lip Gloss
+  - Testing: unit-test update logic (Msg→Model); integration test with fake `sync` source
