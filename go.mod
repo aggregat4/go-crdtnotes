@@ -1,3 +1,3 @@
-module example.com/go-crdt-rope
+module aggregat4.net/go-crdtnotes
 
 go 1.22
