@@ -1,0 +1,45 @@
+## TODOs
+
+- [] Compaction of tombstones and runs
+  - Implement an optional background compaction pass that:
+    - Merges adjacent runs for the same replica when possible
+    - Coalesces long stretches of invisible (Vis=false) entries to reduce memory
+    - Optionally prunes graph artifacts no longer needed for future causality (careful: must preserve RGA semantics and correctness under concurrent ops)
+  - Expose compaction as an explicit API (e.g., `Compact()`), and ensure idempotence and safety under concurrent reads/writes.
+
+- [] Cursor tracking (anchor-based design)
+  - Represent positions as stable anchors: `Cursor{ Anchor ID, Side(Before|After) }` with sticky bias (StickLeft|StickRight)
+  - Keep cursors out of the CRDT state; store in presence/UI, using `Doc` helpers
+  - Extend `Doc` with helpers filled during rebuild:
+    - `idxByID map[ID]int` for O(1) ID→index when cache valid
+    - `IndexOf(id ID) (int, bool)`, `CursorAtIndex(i int, bias) Cursor`, `ResolveCursor(c Cursor) int`
+  - Update rules (applied in UI/presence layer):
+    - Insert at index j: if cursor index i, i++ when j < i; if j == i, advance if bias=StickRight
+    - Delete at index j: if j < i, i--; if j == i, keep at i; if anchor deleted, move to prev/next visible by `Side`
+  - Complexity: cursor resolve O(1) with valid cache; may trigger lazy rebuild O(n log R) when dirty
+
+- [] SQLite persistence (runs + tombstone overlay)
+  - Schema (mirror in-memory model; out-of-order friendly):
+    - `runs(replica TEXT, start_counter INTEGER, text TEXT, PRIMARY KEY(replica, start_counter))`
+    - `edges(parent_replica TEXT, parent_counter INTEGER, child_replica TEXT, child_counter INTEGER, PRIMARY KEY(parent_replica, parent_counter, child_replica, child_counter))` with `INDEX(parent_replica, parent_counter, child_counter, child_replica)`
+    - `tombstones(replica TEXT, counter INTEGER, PRIMARY KEY(replica, counter))`
+    - `pending_inserts(new_replica TEXT, new_counter INTEGER, parent_replica TEXT, parent_counter INTEGER, rune TEXT, PRIMARY KEY(new_replica, new_counter))`
+    - `pending_deletes(target_replica TEXT, target_counter INTEGER, PRIMARY KEY(target_replica, target_counter))`
+    - `meta(key TEXT PRIMARY KEY, value TEXT)`
+  - Operations (transactional, idempotent via UPSERT):
+    - Insert: if parent missing → upsert into `pending_inserts`; else merge into `runs` (append/prepend/new row) and insert `edges`; if pending delete exists for new ID, upsert `tombstones`.
+    - Delete: if target unknown → upsert `pending_deletes`; else upsert into `tombstones`.
+    - Periodic flush: retry all pending once dependencies resolve.
+  - Loading: on open, stream `runs` (grouped by replica), `edges` (bucket by parent), and `tombstones` to build `Doc`; or keep visibility checks in DB if memory-constrained.
+  - Indexing: PKs above suffice; enable WAL; batch ops in one tx when possible.
+  - Architectural separation (clean persistence boundary):
+    - Define storage interfaces in a separate package (ports), e.g.:
+      - `type RunsStore interface { GetPrevNext(replica string, counter int) (prev, next RunRow, err error); UpsertRun(row RunRow) error }`
+      - `type EdgesStore interface { InsertEdge(parent, child ID) error; HasID(id ID) (bool, error); ChildrenOf(parent ID) ([]ID, error) }`
+      - `type TombStore interface { Upsert(ID) error; Exists(ID) (bool, error) }`
+      - `type PendingStore interface { UpsertInsert(op InsertOp) error; UpsertDelete(op DeleteOp) error; ListPending() (ins []InsertOp, dels []DeleteOp, err error) }`
+    - Implement a SQLite adapter in `storage/sqlite` that satisfies these interfaces; keep `crdt` package free of SQL imports.
+    - App/service layer wires `Doc` (domain) to storage (adapter):
+      - On op application: apply to `Doc` first, then persist within a tx; or vice versa depending on durability needs.
+      - On startup: load from storage to construct `Doc` (or replay ops).
+    - Testing: mock interfaces for unit tests; integration tests run against SQLite (in-memory DB).
